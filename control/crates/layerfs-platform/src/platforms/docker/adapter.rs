@@ -88,7 +88,7 @@ impl Adapter for Docker {
     /// `host.docker.internal` to: a Sandbox image's root cannot resolve
     /// the name.
     fn reach(&self, spec: &Spec, url: &str) -> Result<String, MachineError> {
-        if cfg!(target_os = "linux") {
+        if super::cli::host_network() {
             return dial(spec, url, Loopback::Shared);
         }
         dial(spec, url, Loopback::Lookup(&|| host_address(spec)))

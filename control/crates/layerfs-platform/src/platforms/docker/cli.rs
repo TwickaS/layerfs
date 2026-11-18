@@ -15,6 +15,15 @@ pub(super) fn docker(spec: &Spec, args: &[&str]) -> Result<Command, MachineError
     Ok(command)
 }
 
+/// Whether a Linux host's worker shares the host's network. It does not unless
+/// `LAYERFS_DOCKER_HOST_NETWORK` is set: a host-network container is outside
+/// Docker's network isolation and, on Docker Desktop, the VM's network rather
+/// than the host's. The worker otherwise publishes its port on the host's
+/// loopback, as on macOS.
+pub(super) fn host_network() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("LAYERFS_DOCKER_HOST_NETWORK").is_some()
+}
+
 /// The Engine's version, when it answers.
 pub(super) fn engine_version(spec: &Spec) -> Option<String> {
     let command = docker(spec, &["version", "--format", "{{.Server.Version}}"]).ok()?;

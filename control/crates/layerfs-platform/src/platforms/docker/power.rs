@@ -5,7 +5,7 @@
 //! hold an overlay's upper layer. It never sets `user.max_user_namespaces`,
 //! which would change the whole Docker host: every Sandbox command runs
 //! under the filter that refuses a user namespace instead.
-use super::cli::docker;
+use super::cli::{docker, host_network};
 use super::network::published_port;
 use super::unix::{guest, inspect, not_ours, run, WORKER_ROLE};
 use crate::error::{Code, MachineError};
@@ -34,6 +34,7 @@ fn entry() -> String {
     format!(
         r#"set -e
 umask 022
+mount -o remount,rw /sys/fs/cgroup 2>/dev/null || true
 mkdir -p /layerfs/data/store /layerfs/data/sandbox
 chmod 755 /layerfs/data /layerfs/data/store /layerfs/data/sandbox
 {}
@@ -72,6 +73,29 @@ fn ended(spec: &Spec) -> Option<String> {
     Some(said)
 }
 
+/// The Docker network the worker joins: Docker's default bridge when the person
+/// allowed egress (`LAYERFS_DOCKER_EGRESS=open`), else `<vm>-net`, a bridge
+/// without masquerade, created with the machine's label once.
+fn egress_network(spec: &Spec) -> Result<String, MachineError> {
+    if std::env::var("LAYERFS_DOCKER_EGRESS").is_ok_and(|value| value == "open") {
+        return Ok("bridge".to_owned());
+    }
+    let name = format!("{}-net", spec.vm_name);
+    let exists = run(spec, &["network", "inspect", &name], "docker network inspect")?;
+    if !exists.ok() {
+        run(
+            spec,
+            &[
+                "network", "create", "-o", "com.docker.network.bridge.enable_ip_masquerade=false",
+                "--label", "layerfs.role=machine-network", &name,
+            ],
+            "creating the worker's network",
+        )?
+        .answer("creating the worker's network")?;
+    }
+    Ok(name)
+}
+
 /// A fresh worker container: an earlier one of ours is replaced (its Store
 /// volume stays); a container of that name that is not a worker is refused.
 pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineError> {
@@ -99,9 +123,9 @@ pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineErro
     let log = format!("LAYERFS_WORKER_LOG={WORKER_LOG}");
     let entry = entry();
     let tmpfs = format!("{STATE}:mode=0700");
-    // On a Linux Engine the worker shares the host's network and listens on
-    // a host loopback port. Docker Desktop's worker publishes its port.
-    let host_network = cfg!(target_os = "linux");
+    // The worker publishes its port on the host's loopback. Only an explicit
+    // `LAYERFS_DOCKER_HOST_NETWORK` on a Linux host shares the host's network.
+    let host_network = host_network();
     let port = if host_network { tool::free_port()? } else { 0 };
     let listen = match host_network {
         true => format!("LAYERFS_WORKER_LISTEN=127.0.0.1:{port}"),
@@ -111,7 +135,13 @@ pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineErro
     #[rustfmt::skip]
     let mut args = vec![
         "run", "-d", "--pull", "never", "--name", &spec.vm_name, "--init",
-        "--privileged", "--cgroupns", "private",
+        // Not `--privileged`: the worker needs /dev/fuse, CAP_SYS_ADMIN (FUSE
+        // and Sandbox namespaces), CAP_SYS_RESOURCE and a writable cgroup v2
+        // tree (the entry remounts it read-write). Docker's default seccomp
+        // filter stays; AppArmor's default profile blocks the mounts.
+        "--cap-add", "SYS_ADMIN", "--cap-add", "SYS_RESOURCE",
+        "--device", "/dev/fuse", "--security-opt", "apparmor=unconfined",
+        "--cgroupns", "private",
         "--label", ROLE, "--label", &bundle_label,
         // what the entry says before it becomes the worker is bounded too.
         // Always the three together: `--log-opt max-size` alone fails
@@ -127,7 +157,12 @@ pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineErro
             "--network", "host", "--add-host", "host.docker.internal:host-gateway",
         ]);
     } else {
-        args.extend(["-p", &publish]);
+        // Commands in a Sandbox use this container's network. The network
+        // has no masquerade, so they reach no host outside the Docker network
+        // unless the person sets `LAYERFS_DOCKER_EGRESS=open`; the published
+        // port still answers the host.
+        let network = egress_network(spec)?;
+        args.extend(["--network", &network, "--add-host", "host.docker.internal:host-gateway", "-p", &publish]);
     }
     #[rustfmt::skip]
     args.extend([
