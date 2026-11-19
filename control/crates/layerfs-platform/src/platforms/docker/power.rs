@@ -132,6 +132,7 @@ pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineErro
         false => format!("LAYERFS_WORKER_LISTEN=0.0.0.0:{WORKER_PORT}"),
     };
     let publish = format!("127.0.0.1::{WORKER_PORT}");
+    let network = if host_network { String::new() } else { egress_network(spec)? };
     #[rustfmt::skip]
     let mut args = vec![
         "run", "-d", "--pull", "never", "--name", &spec.vm_name, "--init",
@@ -161,7 +162,6 @@ pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineErro
         // has no masquerade, so they reach no host outside the Docker network
         // unless the person sets `LAYERFS_DOCKER_EGRESS=open`; the published
         // port still answers the host.
-        let network = egress_network(spec)?;
         args.extend(["--network", &network, "--add-host", "host.docker.internal:host-gateway", "-p", &publish]);
     }
     #[rustfmt::skip]
