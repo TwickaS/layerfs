@@ -96,6 +96,25 @@ fn egress_network(spec: &Spec) -> Result<String, MachineError> {
     Ok(name)
 }
 
+/// The worker's seccomp profile: Docker's own default plus `pivot_root` under
+/// `CAP_SYS_ADMIN` (`seccomp/README.md`). Docker's filter answers `EPERM` to
+/// `pivot_root`, which every Sandbox's start needs. The file is written to the
+/// machine's folder and passed to `docker run`, which reads it itself.
+const WORKER_SECCOMP: &str = include_str!("seccomp/worker.json");
+
+fn seccomp_option(spec: &Spec) -> Result<String, MachineError> {
+    let file = spec.work_dir.join("worker-seccomp.json");
+    let failed = |error: std::io::Error| {
+        MachineError::new(
+            Code::Failed,
+            format!("writing the worker's seccomp profile {}: {error}", file.display()),
+        )
+    };
+    std::fs::create_dir_all(&spec.work_dir).map_err(failed)?;
+    std::fs::write(&file, WORKER_SECCOMP).map_err(failed)?;
+    Ok(format!("seccomp={}", file.display()))
+}
+
 /// A fresh worker container: an earlier one of ours is replaced (its Store
 /// volume stays); a container of that name that is not a worker is refused.
 pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineError> {
@@ -116,6 +135,7 @@ pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineErro
         )?
         .answer("removing the old worker container")?;
     }
+    let seccomp = seccomp_option(spec)?;
     let bundle_mount = format!("{}:/layerfs/bundle:ro", bundle.dir.display());
     let volume = format!("{}-data:{DATA}", spec.vm_name);
     let bundle_label = format!("layerfs.bundle={}", bundle.hash);
@@ -138,10 +158,12 @@ pub(crate) fn start(spec: &Spec, bundle: &Bundle) -> Result<Running, MachineErro
         "run", "-d", "--pull", "never", "--name", &spec.vm_name, "--init",
         // Not `--privileged`: the worker needs /dev/fuse, CAP_SYS_ADMIN (FUSE
         // and Sandbox namespaces), CAP_SYS_RESOURCE and a writable cgroup v2
-        // tree (the entry remounts it read-write). Docker's default seccomp
-        // filter stays; AppArmor's default profile blocks the mounts.
+        // tree (the entry remounts it read-write). AppArmor's default profile
+        // blocks the mounts; Docker's default seccomp filter stays except that
+        // `pivot_root` is allowed under CAP_SYS_ADMIN (`seccomp/README.md`).
         "--cap-add", "SYS_ADMIN", "--cap-add", "SYS_RESOURCE",
         "--device", "/dev/fuse", "--security-opt", "apparmor=unconfined",
+        "--security-opt", &seccomp,
         "--cgroupns", "private",
         "--label", ROLE, "--label", &bundle_label,
         // what the entry says before it becomes the worker is bounded too.
